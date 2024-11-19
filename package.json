@@ -1,0 +1,19 @@
+{
+  "main": "server.js",
+  "scripts": {
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@graphql-tools/schema": "^10.0.6",
+    "cors": "^2.8.5",
+    "express": "^4.21.1",
+    "express-graphql": "^0.12.0",
+    "graphql": "^14.7.0",
+    "lodash": "^4.17.21",
+    "pg": "^8.13.0",
+    "uuid": "^11.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
