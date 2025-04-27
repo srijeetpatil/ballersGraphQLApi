@@ -1,0 +1,2 @@
+[submodule "functions"]
+	url = git@github.com:srijeetpatil/ballersCloudFunctions.git
