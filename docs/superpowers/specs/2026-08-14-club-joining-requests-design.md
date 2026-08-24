@@ -57,7 +57,16 @@ CREATE UNIQUE INDEX uniq_pending_club_join_request
   WHERE status = 'PENDING';
 
 ALTER TABLE test.alerts ADD COLUMN IF NOT EXISTS request_id INT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_player_club_membership
+  ON test.player_club_map (player_id, club_id);
 ```
+
+`test.player_club_map` had **no** uniqueness on `(player_id, club_id)` — only a primary key
+on `id` plus two foreign keys (verified against dev). The accept path inserts
+unconditionally, so this index makes duplicate membership structurally impossible rather
+than merely unreachable. It matters because `getPlayerClubsFromDb` uses an `INNER JOIN`: a
+duplicate row would make the club appear **twice** in `getPlayerClubs`.
 
 `status` is one of `PENDING`, `ACCEPTED`, `REJECTED`. It is a plain `TEXT` column rather
 than a Postgres enum, matching how `match_status` is stored.
@@ -125,7 +134,18 @@ Resolver (`graphql/resolvers/Play/Mutations.js`):
    Throw `"Missing token"` / `"Missing player ID, Invalid JWT"`, matching
    `getPlayerAlertsForClub`.
 2. Throw `"Club ID is required"` if absent.
-3. Load the club via `getClubByIdFromDb`; throw `"Club not found"` if missing.
+3. Load the club and check it is **eligible to receive requests**: it must exist, have
+   `review_status = 'APPROVED'`, and not be banned (`is_banned IS NOT TRUE`) — the same
+   filter `getClubsListFromDb` already applies. Throw `"Club not found"` for all three
+   cases, so the error does not confirm the existence of a club the caller cannot
+   otherwise see.
+
+   `getClubByIdFromDb` is a bare `SELECT * FROM test.clubs WHERE id = $1` with no filter,
+   so it is **not** sufficient alone — apply the eligibility check after loading.
+
+   `access = 'PRIVATE'` is deliberately **not** enforced. Nothing in the codebase enforces
+   access semantics yet, and every request already needs admin approval, so PRIVATE
+   currently means only "no unsolicited request notifications".
 4. `fetchPlayerClubMap(playerId, clubId)` — if non-empty, throw
    `"Player is already a member of this club"`.
 5. Insert the request. A `23505` unique violation means a `PENDING` request already
@@ -151,11 +171,20 @@ not failed for a data-integrity problem on the club's side.
 
 1. Read the acting admin from `context.token` as above.
 2. Load the request by id; throw `"Join request not found"` if missing.
-3. If `status <> 'PENDING'`, throw `"This join request has already been resolved"`. This
-   also covers two admins acting at once.
-4. `fetchPlayerClubMap(adminId, request.club_id)` — throw
-   `"Only a club admin can respond to join requests"` unless a row exists **and** its
-   `is_admin` is true. Membership alone is not enough.
+3. **Authorize before disclosing anything about the request.**
+   `fetchPlayerClubMap(adminId, request.club_id)` — unless a row exists **and** its
+   `is_admin` is true, throw `"Join request not found"`, the *same* message as a missing
+   request. Membership alone is not enough.
+
+   The ordering and the shared message are both deliberate. With the status check first, or
+   with a distinct `"Only a club admin can respond"` message, any authenticated player could
+   iterate `requestId` values and tell three states apart — absent, resolved, and
+   pending-in-a-club-I-do-not-admin — yielding a map of every join request in the system and
+   its lifecycle. Nothing can be *mutated* cross-club either way, since authorization is
+   scoped to `request.club_id`; this closes the disclosure.
+4. If `status <> 'PENDING'`, throw `"This join request has already been resolved"`. This
+   also covers two admins acting at once. Safe to disclose here — the caller is by now a
+   verified admin of the owning club.
 5. **ACCEPT:** in one transaction, insert `(player_id, club_id, is_creator: false,
    is_admin: false)` into `player_club_map` and set `status = 'ACCEPTED'`,
    `resolved_by = adminId`, `updated_at = now()`.
@@ -204,12 +233,12 @@ request is not lost — only some notifications.
 |---|---|
 | No token / bad JWT | `"Missing token"` / `"Missing player ID, Invalid JWT"` |
 | `clubId` missing | `"Club ID is required"` |
-| Club does not exist | `"Club not found"` |
+| Club missing, unapproved, or banned | `"Club not found"` — one message for all three |
 | Already a member | `"Player is already a member of this club"` |
 | Pending request exists (23505) | `"A join request is already pending for this club"` |
 | Request id not found | `"Join request not found"` |
 | Request already resolved | `"This join request has already been resolved"` |
-| Caller is not an admin | `"Only a club admin can respond to join requests"` |
+| Caller is not an admin | `"Join request not found"` — deliberately identical to the missing-request message, see step 3 |
 | Database failure | `"Failed to create join request: …"` / `"Failed to update join request: …"` |
 
 ## Verification
