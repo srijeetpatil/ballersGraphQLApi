@@ -2,8 +2,8 @@
 
 **Date:** 2026-11-19
 **Branch:** `feat/venues-canonical-entity` (in the `functions` submodule, based on `feat/domain-schema-split`)
-**Status:** Awaiting approval. Builder check done 2026-11-19; the two questions it raised
-for the user were answered 2026-11-20 and are recorded in "Two changes to existing
+**Status:** **Approved 2026-11-20.** Builder check done 2026-11-19; the two questions it
+raised for the user were answered 2026-11-20 and are recorded in "Two changes to existing
 behaviour" near the end.
 **Scope:** Backend only. No client work this round.
 
@@ -377,6 +377,15 @@ no scraping, no Places lookups. Deliver **a checked-in script**, not a migration
 own `UPDATE`, is re-runnable, prints a before/after diff, and takes `--dry-run`. Coordinates
 outside the supported area are refused with a message, so a transposed lat/lng is caught
 rather than stored.
+
+**Who supplies coordinates, confirmed by the user 2026-11-20.** The team gathers the four
+seed turfs' coordinates themselves, and for the foreseeable future verifies every new
+venue by hand too. So coordinates reach the database by two routes only: this script, and
+`adminReviewVenue`. A user submission's coordinates are whatever the client sent, and
+stay `UNVERIFIED` until an admin confirms or corrects them — which is why `VERIFY` accepts
+field edits in the same call rather than requiring a separate `EDIT`. **The submission
+flow is still built this round, unchanged** (user choice, 2026-11-20); the manual
+verification is the review step, not a replacement for it.
 
 A script rather than a migration because the values are hand-researched data, not schema,
 and because getting one wrong should be a re-run rather than a rollback. The team fills in
