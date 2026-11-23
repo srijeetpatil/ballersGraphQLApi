@@ -544,7 +544,7 @@ Expected, given the current four venues: Gymkhana Turf, NR Bhagat Turf, Presenta
 
 ```bash
 git add graphql/dataloaders/venueActivityLoader.js graphql/model/PlayModel.js graphql/schema/Play.js graphql/resolvers/Play/Queries.js play/index.js
-git commit -m "feat(venues): resolve activity and dormancy, order the default list by popularity"
+git commit -m "feat(venues): resolve venue activity and dormancy per request"
 ```
 
 ---
