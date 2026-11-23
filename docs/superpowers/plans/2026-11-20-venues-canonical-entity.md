@@ -430,15 +430,14 @@ and order by `geog <-> public.ST_MakePoint($lng, $lat)::geography`, applying `pu
 
 `radiusMetres` is ignored without coordinates.
 
-**Ordering is three cases, decided by the user 2026-11-23.** This task implements the first two; the third needs the activity aggregate and lands in Task 8:
+**Ordering is two cases, decided by the user 2026-11-23.**
 
 | Case | Order by |
 |---|---|
 | coordinates supplied | distance ascending, null-`geog` rows last, then `name` |
-| no coordinates, `query` supplied | `name` — alphabetical |
-| no coordinates, no `query` (the default list) | popularity, then `name` — **Task 8** |
+| no coordinates | `name` — alphabetical, whether or not `query` was supplied |
 
-So a *text search* without location is alphabetical, deliberately: the user has already told us what they are looking for, and ranking those hits by popularity would push an exact name match below a busier venue. The no-location **default list** is the case popularity serves.
+Popularity or relevance ranking for the no-location case was **considered and deliberately deferred**: the app has no users yet, so there is no signal to rank on, and a ranking built on 49 historical matches would encode noise. Backlogged in Task 14. Alphabetical is the whole fallback — do not add a scoring term.
 
 - [ ] **Step 3: Write the resolver**
 
@@ -483,7 +482,7 @@ git commit -m "feat(venues): add searchVenues with trigram name match and distan
 **Interfaces:**
 - Consumes: `DORMANT_AFTER_DAYS` (Task 4).
 - Produces:
-  - `getVenueActivityByIdsFromDb(venueIds) -> Promise<{ venue_id, last_activity_at, recent_matches, total_matches }[]>` — the loader uses `last_activity_at`; `searchVenuesFromDb` uses the two counts for popularity ordering
+  - `getVenueActivityByIdsFromDb(venueIds) -> Promise<{ venue_id, last_activity_at }[]>`
   - `createVenueActivityLoader() -> DataLoader<number, Date | null>`
   - `context.venueActivityLoader`
   - `Venue.lastActivityAt`, `Venue.isDormant` field resolvers
@@ -536,25 +535,10 @@ Task 7 accepts the flag and ignores it. Now honour it: when `includeDormant` is 
 Verify: `searchVenues(data: { includeDormant: false })`.
 Expected, given the 2026-11-19 history: venues 2 and 4 absent, 1 and 3 present. Then with the default (omit the flag): all four present, with 2 and 4 ordered last.
 
-- [ ] **Step 8: Add the popularity ordering for the no-location default list**
+- [ ] **Step 8: Verify the no-location fallback is alphabetical**
 
-The third ordering case from Task 7's table, **decided by the user 2026-11-23**. When `searchVenuesFromDb` receives neither coordinates nor a `query`, order by match count descending, then `name`.
-
-Extend the activity aggregate to return a count alongside the max, under the **same three predicates** as `lastActivityAt` — not soft-deleted, not `MATCH_INVITATION_DECLINED`, `match_start_time <= now()`:
-
-```sql
-SELECT venue_id,
-       max(match_start_time) AS last_activity_at,
-       count(*) FILTER (WHERE match_start_time > now() - interval '90 days') AS recent_matches,
-       count(*) AS total_matches
-```
-
-Order by `recent_matches DESC, total_matches DESC, name ASC`. **Builder's note: the recent-then-all-time pair is this plan's call, not the user's.** All-time alone would let a turf closed for renovation six months ago keep leading the list; recent alone would bury a venue with history but a quiet quarter below a brand-new one with a single game. The 90 days deliberately reuses `DORMANT_AFTER_DAYS` rather than introducing a second window.
-
-Popularity is **not** exposed as a `Venue` field — it is ordering only. Adding it to the type later is additive.
-
-Verify: `searchVenues(data: {})` — no coordinates, no query.
-Expected, given the 2026-11-19 history: Presentation Convent School Turf (21 matches) first, then Gymkhana (14), NR Bhagat (10), Terna (4) — **not** alphabetical, which would have put Gymkhana first and Presentation Convent third. Then `searchVenues(data: { query: "turf" })` with no coordinates: expected **alphabetical**, confirming the two cases are genuinely distinct.
+`searchVenues(data: {})` — no coordinates, no query.
+Expected, given the current four venues: Gymkhana Turf, NR Bhagat Turf, Presentation Convent School Turf, Terna College Turf — plain alphabetical, with no popularity or relevance term anywhere in the `ORDER BY`.
 
 - [ ] **Step 9: Commit**
 
@@ -798,6 +782,7 @@ git commit -m "feat(matches): reject closed, merged and rejected venues on match
 - `play.venues.pincode` is an `integer` — fine for Indian six-digit pincodes, wrong in principle. Deliberately untouched.
 - The module-level `venueLoader` caches for the process lifetime, and venue data now changes through admin action rather than never, so a verified or merged venue serves stale from warm instances. Pre-existing item, newly sharper.
 - Dormancy filtering is built but off by default; revisit the 90-day cutoff when there are enough venues for it to be a kindness. Record that at four venues it would have hidden two, including one with 14 matches.
+- **Venue ranking for the no-location case — deferred 2026-11-23, revisit once the app has users.** `searchVenues` falls back to alphabetical when it has no coordinates. Popularity ordering (match count, recent-weighted) was designed and deliberately dropped: with no users, a ranking built on 49 historical matches would encode noise rather than preference. When there is real usage, the ordering hook is one `ORDER BY` in `searchVenuesFromDb`, and the activity aggregate in `getVenueActivityByIdsFromDb` is where the counts would come from. Open questions for then: whether to weight recent activity over all-time and over what window, whether to expose the count as a `Venue` field for a "most played here" label, and whether personal history ("venues you've played at") beats global popularity as a picker default.
 - `VENUE_FORMATS` exists in `venueGeo.js` and `play.matches.format` is still unconstrained; converging them is a follow-up.
 - Whether `play.matches.venue_id` should become `NOT NULL` (0 of 49 are null today).
 - Deferred by the brief: booking integration, the owner-claim flow, a venue edit-suggestions table, multi-city tooling, and admin notification of new submissions (with the reason it was dropped).
