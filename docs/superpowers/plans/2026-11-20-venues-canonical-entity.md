@@ -664,13 +664,13 @@ In one transaction, in this order:
 2. `UPDATE play.matches SET venue_id = $target WHERE venue_id = $source`.
 3. **Clear the two report collisions, then repoint the reports.** A bare `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source` **fails** — both hazards were confirmed empirically against the live schema on 2026-11-23, and the second is the single most likely merge path there is. In order:
 
-   a. **The report this merge answers.** Rows with `venue_id = $source AND duplicate_of_venue_id = $target` are reports saying "source is a duplicate of target" — exactly what `duplicate_of_venue_id` exists for, and exactly what the admin is acting on. Repointing one would leave `venue_id = duplicate_of_venue_id = $target` and trip `venue_reports_no_self_duplicate_check` with `23514`, aborting the whole merge. Resolve them instead: `status = 'RESOLVED'`, `resolution_note` naming the merge, `resolved_by = $adminPlayerId`, `resolved_at = now()`, **and `duplicate_of_venue_id = NULL`** so the row survives the repoint in step (d).
+   a. **The report this merge answers.** Rows with `venue_id = $source AND duplicate_of_venue_id = $target` are reports saying "source is a duplicate of target" — exactly what `duplicate_of_venue_id` exists for, and exactly what the admin is acting on. Repointing one would leave `venue_id = duplicate_of_venue_id = $target` and trip `venue_reports_no_self_duplicate_check` with `23514`, aborting the whole merge. Resolve them instead: `status = 'RESOLVED'`, `resolution_note` naming the merge, `resolved_by = $adminPlayerId`, `resolved_at = now()`, **and `duplicate_of_venue_id = NULL`** — the one place a pointer is nulled, and only on a row this statement is itself resolving. Restrict it to `status = 'OPEN'`: closed reports of this shape are left completely alone, because (d) no longer moves them so the CHECK cannot fire on them.
 
-   b. **Pointers at the disappearing venue.** Rows with `duplicate_of_venue_id = $source` should now point at the survivor: set `duplicate_of_venue_id = $target`. Except where that row's own `venue_id = $target` — those would become self-referential and trip the same check — so for those, set `duplicate_of_venue_id = NULL` and resolve them as in (a); the duplicate they named has been merged away, so the report is answered.
+   b. **Pointers at the disappearing venue.** Rows with `duplicate_of_venue_id = $source` should now point at the survivor: set `duplicate_of_venue_id = $target`. Except where that row's own `venue_id = $target` — those would become self-referential and trip the same check — so for those the pointer **stays on the source**, which survives the merge and still resolves. Redirect the others whatever their status; resolve the OPEN exception rows, since the merge answers them. **Nothing is nulled here.**
 
    c. **Open reports colliding on the partial unique index.** If one user holds an `OPEN` report on both source and target, repointing makes two rows `(target, user, OPEN)` and trips `venue_reports_one_open_per_user_venue` with `23505`. Resolve the **source** one — the target's already points at the surviving venue — with a `resolution_note` naming the merge.
 
-   d. Only now `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source`.
+   d. Only now `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source AND status = 'OPEN'`. **Only OPEN reports make the trip** — the admin has to see them against the venue that still exists. Closed reports stay on the source, which lives forever, resolves through the unfiltered loader, and is read by nothing (the queue selects OPEN only). This is what removes the pointer-nulling class entirely rather than annotating it, and it means `reportsRepointed` counts open reports only.
 
 4. **Move** `google_place_id` to the target if the target has none: set it on the target, `NULL` it on the source. Copy coordinates and details the target lacks.
 5. Set `merged_into_venue_id = $target`, `status = 'MERGED'` on the source.
@@ -678,6 +678,11 @@ In one transaction, in this order:
 Step 4 must *move* and not copy: the source row lives forever and `venues_google_place_id_uniq` forbids two non-null rows sharing a place_id.
 
 **Verification for step 3 is mandatory, and the plain case passing proves nothing.** An ordinary report repoints fine; it is these three that break. See Step 6.
+
+**Amended 2026-11-24 after the Task 12 review.** Two changes above are corrections, not refinements. (1) A Critical review finding: the merge must also repoint rows pointing *at* the source — `UPDATE play.venues SET merged_into_venue_id = $target WHERE merged_into_venue_id = $source` — or merging A→B then B→C leaves A pointing at a MERGED row, and the one-hop redirect hands a client a shell venue. Reproduced live before the fix. (2) The claim that the self-duplicate CHECK forces nulling a closed report's pointer was false; restricting (d) to OPEN rows removes the whole class. Add to Step 6b: the A→B→C chain; `CLOSE`/`REJECT` carrying a stray `name` leaving the name untouched; `VERIFY` on a REJECTED venue refused; `REJECT`/`CLOSE` on a venue others merged into refused; a **non-OPEN** report in shapes (a) and (b) coming out byte-identical; and `lat: 200` refused without a raw SQLSTATE.
+
+Also settled in review: `REJECT` and `CLOSE` apply **no** field edits (the brief and the SDL doc string both said so; the first implementation applied them). `EDIT` stays permissive on CLOSED/REJECTED — gate the status transitions, not the edits.
+
 
 - [ ] **Step 4: Implement `adminResolveVenueReport`**
 
@@ -698,7 +703,7 @@ Expected: every match repointed to the target; target now holds the `google_plac
 A merge whose reports repoint cleanly proves nothing — only these three break. For each, set the state up, run `MERGE`, and confirm it **completes** rather than aborting:
 
 1. A `DUPLICATE` report with `venue_id = source`, `duplicate_of_venue_id = target`. Without step 3(a) this aborts with `23514 venue_reports_no_self_duplicate_check`. Expected after: the merge succeeded and that report is `RESOLVED` with `duplicate_of_venue_id` null.
-2. A report elsewhere with `duplicate_of_venue_id = source`. Expected after: it points at the target — or is `RESOLVED` with a null pointer if its own `venue_id` is the target.
+2. A report elsewhere with `duplicate_of_venue_id = source`. Expected after: it points at the target — or, if its own `venue_id` is the target, it **keeps its pointer on the source** (resolved if it was OPEN, untouched if it was closed). Its `duplicate_of_venue_id` must NOT be null.
 3. One user holding an `OPEN` report on **both** source and target. Without step 3(c) this aborts with `23505 venue_reports_one_open_per_user_venue`. Expected after: the merge succeeded, the source-side report is `RESOLVED`, and the target-side one is still `OPEN`.
 
 Then confirm the ordinary case still works: a plain `WRONG_DETAILS` report on the source ends up on the target, still `OPEN`.

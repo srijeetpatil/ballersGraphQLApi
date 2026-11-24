@@ -459,6 +459,9 @@ says a merged venue still resolves on an old match.
   is the client-facing lookup, and the only way it sees a `MERGED` id is a stale one — a
   cached picker entry or a deep link — where landing on the surviving venue is exactly
   what the caller wants.
+- **The redirect is always exactly one hop, and the merge is what keeps it that way** by
+  repointing inbound `merged_into_venue_id` rows (step 4 below). A chain would silently
+  break the one-hop lookup.
 - **`venueLoader` / `Match.venue` does NOT redirect.** The merge mutation repoints
   `play.matches.venue_id` to the target, so after a successful merge no match points at a
   `MERGED` venue at all. If one ever does, something went wrong, and silently displaying
@@ -728,15 +731,35 @@ two untrusted paths, submission and the backfill script.
      disappearing venue (`duplicate_of_venue_id = $source`), resolve the source-side
      report where one user holds an `OPEN` report on **both** venues (which would
      otherwise collide on `venue_reports_one_open_per_user_venue`), and only then
-     `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source`.
-     The plan's Task 12 step 3 carries the exact ordering.
+     `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source
+     AND status = 'OPEN'`. The plan's Task 12 step 3 carries the exact ordering.
+
+     **Amended 2026-11-24 after the Task 12 review.** Only `OPEN` reports are
+     repointed, and no statement nulls a `duplicate_of_venue_id` on a report it is not
+     itself resolving. As first written, this section had closed reports repointed too,
+     which forced their pointers to be nulled to satisfy
+     `venue_reports_no_self_duplicate_check` — losing the record that a venue had ever
+     been named as the original. That was described during implementation as unavoidable;
+     it was not. Closed reports simply stay on the source, which lives forever, resolves
+     through the unfiltered loader, and is read by nothing, since the review queue selects
+     `OPEN` only. `reportsRepointed` therefore counts open reports only.
 
      The first case is not an edge case: a report saying "source is a duplicate of
      target" is precisely what `duplicate_of_venue_id` exists for and precisely what
      an admin clicking MERGE is acting on. The original bare `UPDATE` would have
      aborted the entire merge transaction with `23514` the first time it was used as
      designed.
-  4. Set `merged_into_venue_id = $target`, `status = 'MERGED'` on the source.
+  4. Set `merged_into_venue_id = $target`, `status = 'MERGED'` on the source, **and
+     repoint every row that pointed at the source**:
+     `UPDATE play.venues SET merged_into_venue_id = $target WHERE merged_into_venue_id = $source`.
+
+     **Added 2026-11-24; this was a Critical review finding, reproduced live.** Without it,
+     merging A into B and later B into C leaves A pointing at B while B is itself `MERGED`.
+     Because the by-id lookup follows exactly **one** hop, a client opening A is handed B —
+     a `MERGED` shell with no matches and no reports. Guarding the *target* (refusing a
+     `MERGED`/`REJECTED` target) does not cover this: it is the **inbound** direction. The
+     statement cannot self-reference, since the only row it could aim at itself is one whose
+     status would then be `MERGED`, which the target guard already refuses.
   5. **Move** `google_place_id` from source to target if the target has none: set it on
      the target and `NULL` it on the source, in that order, in the same statement pair.
      Carry over coordinates and details the target is missing by **copying** — a merge
