@@ -760,8 +760,15 @@ two untrusted paths, submission and the backfill script.
      `MERGED`/`REJECTED` target) does not cover this: it is the **inbound** direction. The
      statement cannot self-reference, since the only row it could aim at itself is one whose
      status would then be `MERGED`, which the target guard already refuses.
-  5. **Move** `google_place_id` from source to target if the target has none: set it on
-     the target and `NULL` it on the source, in that order, in the same statement pair.
+  5. **Move** `google_place_id` from source to target if the target has none: **`NULL` it on
+     the source FIRST, then set it on the target.** That order is not a preference — it is
+     the only one Postgres permits. `venues_google_place_id_uniq` is a partial unique index
+     enforced **per statement**, not deferred to commit, so setting the target while the
+     source still holds the id raises `23505` even inside one transaction. Verified against
+     the live schema 2026-11-24: target-first raises `23505 venues_google_place_id_uniq`,
+     source-first succeeds, and a single statement updating both rows at once also succeeds.
+     (This text said "in that order" for the target-first sequence until 2026-11-24; the
+     code was right and the spec was wrong.)
      Carry over coordinates and details the target is missing by **copying** — a merge
      should not lose the better record.
 
