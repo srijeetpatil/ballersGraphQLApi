@@ -290,7 +290,9 @@ CREATE INDEX venues_created_by_idx ON play.venues (created_by_user_id, created_a
 
 The partial unique index is what enforces "unique where not null" — a plain `UNIQUE`
 constraint would permit only one null in some engines and is the wrong tool here. The trgm
-index uses the already-installed `pg_trgm` and is what makes fuzzy name search cheap. The
+index uses the already-installed `pg_trgm` and is what makes substring name search cheap
+(see the clarification below — it indexes `ILIKE '%…%'`, which is not the same as
+typo-tolerant matching). The
 `created_by` index serves the per-user rate-limit count.
 
 `CREATE INDEX` is **not** `CONCURRENTLY`: at four rows it is instantaneous, and
@@ -407,7 +409,6 @@ A module `functions/graphql/utils/venueGeo.js` holds:
 - `DUPLICATE_RADIUS_METRES = 50`.
 - `SUBMISSIONS_PER_USER_PER_DAY = 3` — the brief says "a few per day". **Builder's note:
   3 is this design's call, not the user's.** One constant, easy to change.
-- `DORMANT_AFTER_DAYS = 90`.
 - `buildMapsUrl({ lat, lng, googlePlaceId })`.
 - `VENUE_FORMATS` — `['1v1','2v2','3v3','5v5','6v6','7v7','9v9','11v11']`, the values
   already present in `play.matches.format`. `submitVenue` and `adminReviewVenue`
@@ -450,59 +451,72 @@ The last column is the anti-goal above: a match played at a since-rejected venue
 still render. So `getVenueById` and the DataLoader **never filter by status** — only the
 list and search queries do.
 
-`MERGED` venues redirect: resolving one follows `merged_into_venue_id` to the surviving
-venue. One hop only, and the merge mutation must prevent chains (see below).
+`MERGED` venues redirect — **but only on the by-id lookup, never through the DataLoader.**
+Clarified 2026-11-23; as first written this sentence contradicted the table above it, which
+says a merged venue still resolves on an old match.
 
-### Dormancy — built, but off by default
+- **`getVenueById` follows `merged_into_venue_id` one hop** and returns the survivor. This
+  is the client-facing lookup, and the only way it sees a `MERGED` id is a stale one — a
+  cached picker entry or a deep link — where landing on the surviving venue is exactly
+  what the caller wants.
+- **`venueLoader` / `Match.venue` does NOT redirect.** The merge mutation repoints
+  `play.matches.venue_id` to the target, so after a successful merge no match points at a
+  `MERGED` venue at all. If one ever does, something went wrong, and silently displaying
+  a *different* venue on a historical fixture would hide the fault instead of showing it.
+  The row still resolves, which is what the table's "resolves on an old match" means.
 
-**`lastActivityAt` and `isDormant` are `Venue` field resolvers, not columns on the list
-queries.** This is deliberate and load-bearing:
+One hop only, and the merge mutation must prevent chains (see below).
 
-- The three existing read paths (`getAllVenuesFromDb`, `getVenuesByIdsFromDb`,
-  `getVenueByIdFromDb`) keep their current `SELECT` lists untouched. `getAllVenues`
-  therefore stays byte-identical, which the anti-goals require.
-- Dormancy must never enter the module-level `venueLoader` cache. That cache lives for
-  the whole process lifetime (see `docs/BACKLOG.md`), and dormancy changes **with the
-  clock**, not only with an admin action — a value frozen at instance start would be
-  wrong in a way the existing staleness is not.
+### Dormancy — REMOVED 2026-11-24
 
-So the resolver uses its own activity loader, created **per request** and placed on the
-GraphQL context, following the per-request precedent in
-`graphql/context/viewerScope.js` rather than the module-level DataLoaders. Because the
-loader can always compute an answer, `isDormant` stays non-null.
+Removed at the project owner's request, before it shipped: *"No need for the dormancy
+algorithms, we are still building the earliest of the systems, at this point no need for
+perfection."* It had been built and was taken back out, not merely switched off.
 
-The activity query is a `LEFT JOIN` aggregate over `play.matches`. No denormalised
-`last_activity_at` column: at four venues and 49 matches it is free, and a maintained
-column is a write-path change for no present gain. When the table reaches a size where
-this matters, add the column, maintain it on match insert, and encode the same predicate
-below — the query shape stays the same.
+Gone: `Venue.isDormant`, `Venue.lastActivityAt`, their field resolvers, the per-request
+activity loader, `includeDormant` on `venueSearchInput`, and `DORMANT_AFTER_DAYS`. Nothing
+about a venue's last activity is exposed or queried. `searchVenues` orders by distance when
+coordinates are supplied and by `name` otherwise, and filters only on status.
 
-### What counts as activity
+Three things learned, kept here so a later attempt does not rediscover them:
 
-`max(match_start_time)` alone would be wrong three ways, so the predicate mirrors
-`getClubMatchesFromDb`:
+1. **The activity predicate cannot be a bare `max(match_start_time)`.** It must exclude
+   soft-deleted matches, `match_status = 'MATCH_INVITATION_DECLINED'`, and future kickoffs
+   (`match_start_time <= now()`). Measured against real data those three clauses exclude 6
+   of 49 matches, so without them a venue reports activity on a date that has not happened.
+2. **Any loader must be per request.** Dormancy changes with the clock, not only when data
+   changes, and the module-level `venueLoader` caches for the whole process lifetime — a
+   value cached there would be wrong in a way the existing staleness is not.
+3. **Dormancy must never touch `ORDER BY`.** When it did, the alphabetically-first venue
+   (Gymkhana Turf, the one dormant venue) was pushed to the bottom of the picker, which
+   contradicts the plain alphabetical fallback the owner chose.
 
-```sql
-WHERE m.is_deleted IS NOT TRUE
-  AND m.match_status IS DISTINCT FROM 'MATCH_INVITATION_DECLINED'
-  AND m.match_start_time <= now()
-```
+For the record, the measurement that made the rule look unattractive at this size: of four
+venues only Gymkhana Turf was dormant (last played 2025-11-30, 359 days, 14 matches);
+NR Bhagat Turf at 78 days sat inside the window.
 
-A soft-deleted match is not activity. A declined invitation never happened. And a match
-scheduled for next week is not *past* activity — without the `now()` cap,
-`lastActivityAt` can be a future date, which the client cannot sensibly label and which
-would make a venue look active on the strength of one speculative booking.
-**Builder's note: this predicate is this design's call, not the user's.** If the
-denormalised column arrives later it must encode the same rule.
 
-**The filter defaults to off.** At a 90-day cutoff today, Gymkhana Turf (last match
-2025-11-30, 14 matches) and NR Bhagat Turf (last match 2026-09-06, 10 matches) would both
-vanish from the picker — half the venues and half the match history. `searchVenues` takes
-`includeDormant`, defaulting to `true`, and dormancy affects **sort order** (dormant
-venues sort last) rather than membership. Revisit when there are enough venues for the
-rule to be a kindness rather than a mutilation.
+### Name matching is substring, not fuzzy
 
-`Venue.lastActivityAt` and `Venue.isDormant` are exposed so the client can tag them.
+Clarified 2026-11-23 after implementation. The spec originally called this "fuzzy name
+match via pg_trgm", which overstated it. What is built, and what `pg_trgm`'s GIN index
+accelerates here, is `name ILIKE '%' || $q || '%'`: **case-insensitive substring
+matching.** So `"CONVENT"` and `"bhagat"` both find their venue, but `"convnt"` finds
+nothing.
+
+Typo tolerance would need a similarity predicate (`name % $q`, using `pg_trgm`'s
+`%` operator and its similarity threshold) and would naturally want similarity ordering,
+which pulls against the deliberately plain alphabetical ordering the user chose.
+
+**Confirmed by the user 2026-11-24: substring matching for now, and typo tolerance will be
+added across every search surface at once rather than feature by feature.** The codebase
+has more than one search — venue name here, and club name/locality/description in
+`getClubsListFromDb` — and they should not diverge in how forgiving they are. Backlogged
+as one coordinated change.
+
+User input is escaped through `escapeLike` (`graphql/utils/clubSearch.js`), the same helper
+club search uses, so `%` and `_` match literally and a query of `%` returns nothing rather
+than every venue.
 
 ### Distance sorting
 
@@ -543,8 +557,6 @@ type Venue {
   lastVerifiedAt: Date
   createdAt: Date!
   mergedIntoVenueId: Int
-  lastActivityAt: Date     # from matches
-  isDormant: Boolean!
   distanceMetres: Float    # only when the query supplied coordinates
 }
 ```
@@ -580,12 +592,12 @@ visibility table.
 
 ```graphql
 input venueSearchInput {
-  query: String            # fuzzy name match via pg_trgm
+  query: String            # case-insensitive SUBSTRING match, trigram-indexed. NOT typo-tolerant
+                           #   — see "Name matching is substring, not fuzzy" below
   lat: Float               # supplying both enables distance sorting
   lng: Float
   radiusMetres: Int        # ignored without coordinates
   includeClosed: Boolean   # default false
-  includeDormant: Boolean  # default TRUE - see Dormancy
   limit: Int               # default 20, hard cap 50
 }
 ```
@@ -708,7 +720,22 @@ two untrusted paths, submission and the backfill script.
      or `REJECTED`. **No chains**: merging into an already-merged venue is refused, so
      the redirect is always one hop.
   2. `UPDATE play.matches SET venue_id = $target WHERE venue_id = $source`.
-  3. `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source`.
+  3. Repoint the reports — **but not with a bare `UPDATE`.** Corrected 2026-11-23,
+     after both failures below were reproduced against the live schema. Resolve the
+     reports this merge answers (`venue_id = $source AND duplicate_of_venue_id = $target`,
+     which would otherwise become self-referential and trip
+     `venue_reports_no_self_duplicate_check`), redirect or resolve pointers at the
+     disappearing venue (`duplicate_of_venue_id = $source`), resolve the source-side
+     report where one user holds an `OPEN` report on **both** venues (which would
+     otherwise collide on `venue_reports_one_open_per_user_venue`), and only then
+     `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source`.
+     The plan's Task 12 step 3 carries the exact ordering.
+
+     The first case is not an edge case: a report saying "source is a duplicate of
+     target" is precisely what `duplicate_of_venue_id` exists for and precisely what
+     an admin clicking MERGE is acting on. The original bare `UPDATE` would have
+     aborted the entire merge transaction with `23514` the first time it was used as
+     designed.
   4. Set `merged_into_venue_id = $target`, `status = 'MERGED'` on the source.
   5. **Move** `google_place_id` from source to target if the target has none: set it on
      the target and `NULL` it on the source, in that order, in the same statement pair.

@@ -4,7 +4,7 @@
 
 **Goal:** Turn `play.venues` from a four-row name lookup into the canonical venue entity — coordinates, status, provenance, user submissions with dedupe, and an admin review/merge/report queue.
 
-**Architecture:** Four knex migrations add PostGIS, extend `play.venues` with plain `numeric` lat/lng plus a generated `geography` column, add the missing `matches.venue_id` foreign key, and create `play.venue_reports`. The application layer stays on the existing `pg` pool: new model functions in `graphql/model/PlayModel.js`, a new `graphql/utils/venueGeo.js` for the launch-area and dedupe constants, a new `graphql/utils/venueMappers.js` for row mapping, and a per-request activity DataLoader so dormancy never enters a process-lifetime cache.
+**Architecture:** Four knex migrations add PostGIS, extend `play.venues` with plain `numeric` lat/lng plus a generated `geography` column, add the missing `matches.venue_id` foreign key, and create `play.venue_reports`. The application layer stays on the existing `pg` pool: new model functions in `graphql/model/PlayModel.js`, a new `graphql/utils/venueGeo.js` for the launch-area and dedupe constants, a new `graphql/utils/venueMappers.js` for row mapping.
 
 **Tech Stack:** Node 22, Cloud Functions (Firebase), express-graphql + `@graphql-tools/schema`, graphql 14, `pg` pool for all queries, knex **for migrations only** (devDependency), Neon Postgres 15.20, PostGIS 3.3.10, `pg_trgm` 1.6.
 
@@ -26,7 +26,7 @@
 - **Timestamps are `timestamptz`.**
 - **Existing venue ids 1–4 are permanent.** 49 matches reference them by bare integer.
 - **Never hard-delete a venue.**
-- Exact values: `DUPLICATE_RADIUS_METRES = 50`, `SUBMISSIONS_PER_USER_PER_DAY = 3`, `DORMANT_AFTER_DAYS = 90`, `SUPPORTED_AREA` = lat 18.90–19.20, lng 72.95–73.15, `searchVenues` limit default 20 / hard cap 50.
+- Exact values: `DUPLICATE_RADIUS_METRES = 50`, `SUBMISSIONS_PER_USER_PER_DAY = 3`, `SUPPORTED_AREA` = lat 18.90–19.20, lng 72.95–73.15, `searchVenues` limit default 20 / hard cap 50.
 
 ## Review Focus
 
@@ -49,7 +49,6 @@ Five things the spec implies, that no single task's happy path exercises, most l
 - `migrations/<ts>_create_venue_reports.js` — the reports table.
 - `graphql/utils/venueGeo.js` — launch-area and dedupe constants, `isInSupportedArea`, `buildMapsUrl`, `VENUE_FORMATS`, `VENUE_SURFACES`.
 - `graphql/utils/venueMappers.js` — `mapVenueRow`.
-- `graphql/dataloaders/venueActivityLoader.js` — per-request loader factory.
 - `scripts/backfill-venue-coordinates.js` — one-off, re-runnable, `--dry-run`.
 
 **Modified:**
@@ -58,7 +57,6 @@ Five things the spec implies, that no single task's happy path exercises, most l
 - `graphql/resolvers/Play/Queries.js` — read resolvers and the `Venue` field resolvers.
 - `graphql/resolvers/Play/Venues.js` — **new file** for the write resolvers (`submitVenue`, `reportVenueProblem`, `adminReviewVenue`, `adminResolveVenueReport`), following the `ClubJoinRequests.js` precedent of a per-feature resolver file rather than growing `Mutations.js`.
 - `graphql/resolvers/Play/index.js` — wire the new resolvers.
-- `play/index.js` — add the activity loader to the per-request context.
 - `docs/BACKLOG.md` (parent repo) — the deferred items this work surfaces.
 
 ---
@@ -89,7 +87,7 @@ Expected: exactly 4 rows, ids 1–4, names `Terna College Turf`, `NR Bhagat Turf
 
 - [ ] **Step 3: Create `<ts>_extend_venues.js`**
 
-`up`, in order: lock timeouts; `ALTER TABLE play.venues` adding the fourteen columns per the spec's table; the seven `CHECK` constraints; the five indexes; then the seed-row backfill:
+`up`, in order: lock timeouts; `ALTER TABLE play.venues` adding the fourteen columns per the spec's table; the **two foreign keys** (`created_by_user_id` → `auth.players(id)` `ON DELETE SET NULL`, and the `merged_into_venue_id` self-FK `ON DELETE RESTRICT`); the **eight** `CHECK` constraints; the five indexes; then the seed-row backfill:
 
 ```sql
 UPDATE play.venues
@@ -248,7 +246,6 @@ git commit -m "feat(db): add venue_reports table for the admin review queue"
   - `isInSupportedArea({ lat, lng }) -> boolean`
   - `DUPLICATE_RADIUS_METRES = 50`
   - `SUBMISSIONS_PER_USER_PER_DAY = 3`
-  - `DORMANT_AFTER_DAYS = 90`
   - `VENUE_FORMATS = ['1v1','2v2','3v3','5v5','6v6','7v7','9v9','11v11']`
   - `VENUE_SURFACES = ['TURF','GRASS','CONCRETE','OTHER']`
   - `buildMapsUrl({ lat, lng, googlePlaceId }) -> string | null`
@@ -300,6 +297,12 @@ git commit -m "feat(venues): add launch-area constants and maps link builder"
 An editable `VENUE_DATA` map keyed by venue id, each value `{ lat, lng, address, city, locality, formats, surface, floodlights }`. For each entry: refuse with a message naming the id if `lat`/`lng` are null or `isInSupportedArea` is false (**this is what catches a transposed lat/lng**), validate `formats` against `VENUE_FORMATS` and `surface` against `VENUE_SURFACES`, then one `UPDATE ... WHERE id = $n` per row. Print each row before and after. Support `--dry-run`, which does everything but the `UPDATE`.
 
 Re-runnable: it sets absolute values, never increments. It does **not** touch `status` or `source`.
+
+**Writing requires an explicit `--apply`; a bare run previews.** Changed 2026-11-23 after review found the original `--dry-run` parsing failed open — `process.argv.includes("--dry-run")` is an exact match, so `--dryrun` or `-n` silently performed a live write while the operator believed they had asked for a preview. The operator here is the project owner, running by hand against the only database, so the default must be the safe one. Any unrecognised argument exits 2 before touching the database, and `--apply --dry-run` together is refused rather than silently resolved.
+
+The preview also prints the row **as it would be after** the update, not just the current row — otherwise it is not a diff and cannot serve as the check before an `--apply`.
+
+Each entry carries a required `name` that must match the venue already in the database, because the map targets production rows by bare id and a mistyped key would otherwise write one venue's coordinates onto another. Unknown keys inside an entry, and empty-string values for `address`/`city`/`locality`, are refused rather than silently ignored or written.
 
 - [ ] **Step 2: Dry run**
 
@@ -354,8 +357,6 @@ git commit -m "feat(venues): add re-runnable coordinate backfill script"
 
 Add `city`, `lat: Float`, `lng: Float`, `status: String!`, `source: String!`, `googlePlaceId`, `mapsUrl`, `formats: [String!]`, `surface`, `floodlights`, `lastVerifiedAt: Date`, `createdAt: Date!`, `mergedIntoVenueId: Int`, `distanceMetres: Float`. Keep `id`, `name`, `address`, `pincode`, `locality` **exactly as they are**. Add `getVenueById(id: ID!): Venue` to `Query`.
 
-(`lastActivityAt` and `isDormant` arrive in Task 8, not here.)
-
 - [ ] **Step 2: Write `mapVenueRow`**
 
 Maps `google_place_id` → `googlePlaceId`, `merged_into_venue_id` → `mergedIntoVenueId`, `last_verified_at` → `lastVerifiedAt`, `created_at` → `createdAt`, and computes `mapsUrl` via `buildMapsUrl`. Spreads the row first, as `mapMatchRow` does, so snake_case columns stay available to field resolvers. Passes `distance_metres` through as `distanceMetres` when present. Returns `null` for a falsy row.
@@ -406,15 +407,15 @@ git commit -m "feat(venues): expose location and status fields, require a JWT on
 **Interfaces:**
 - Consumes: `mapVenueRow` (Task 6), `DUPLICATE_RADIUS_METRES` not needed here.
 - Produces:
-  - `input venueSearchInput { query, lat, lng, radiusMetres, includeClosed, includeDormant, limit }`
+  - `input venueSearchInput { query, lat, lng, radiusMetres, includeClosed, limit }`
   - `searchVenuesFromDb({ query, lat, lng, radiusMetres, includeClosed, limit }) -> Promise<Row[]>`
   - `searchVenues(_obj, { data }, context) -> Promise<Venue[]>`
 
 - [ ] **Step 1: Add the input and query to the SDL**
 
-`searchVenues(data: venueSearchInput!): [Venue!]!`. Defaults: `includeClosed` false, `includeDormant` **true**, `limit` 20 with a hard cap of 50 enforced in the resolver.
+`searchVenues(data: venueSearchInput!): [Venue!]!`. Defaults: `includeClosed` false, `limit` 20 with a hard cap of 50 enforced in the resolver.
 
-`includeDormant` is **accepted and ignored in this task** — honouring `false` needs the activity SQL, which lands in Task 8. Note that in the SDL description so it is not mistaken for working.
+There is no `includeDormant` field: dormancy was removed from this feature entirely on 2026-11-24 (see Task 8).
 
 - [ ] **Step 2: Write `searchVenuesFromDb`**
 
@@ -473,79 +474,40 @@ git commit -m "feat(venues): add searchVenues with trigram name match and distan
 
 ---
 
-## Task 8: Activity — `lastActivityAt` and `isDormant`
+## Task 8: ~~Activity — `lastActivityAt` and `isDormant`~~ — **REMOVED**
 
-**Files:**
-- Create: `graphql/dataloaders/venueActivityLoader.js`
-- Modify: `graphql/model/PlayModel.js`, `graphql/schema/Play.js`, `graphql/resolvers/Play/Queries.js`, `play/index.js`
-
-**Interfaces:**
-- Consumes: `DORMANT_AFTER_DAYS` (Task 4).
-- Produces:
-  - `getVenueActivityByIdsFromDb(venueIds) -> Promise<{ venue_id, last_activity_at }[]>`
-  - `createVenueActivityLoader() -> DataLoader<number, Date | null>`
-  - `context.venueActivityLoader`
-  - `Venue.lastActivityAt`, `Venue.isDormant` field resolvers
-
-- [ ] **Step 1: Write `getVenueActivityByIdsFromDb`**
-
-```sql
-SELECT venue_id, max(match_start_time) AS last_activity_at
-  FROM play.matches
- WHERE venue_id = ANY($1::int[])
-   AND is_deleted IS NOT TRUE
-   AND match_status IS DISTINCT FROM 'MATCH_INVITATION_DECLINED'
-   AND match_start_time <= now()
- GROUP BY venue_id
-```
-
-All three predicates are load-bearing: a soft-deleted match is not activity, a declined invitation never happened, and a future kickoff is not *past* activity. Without the `now()` cap, `lastActivityAt` can be a future date.
-
-- [ ] **Step 2: Write the loader factory**
-
-`createVenueActivityLoader` — a `DataLoader` built **per request**, following `createMatchLoader` in `graphql/dataloaders/matchLoader.js`, with a comment saying why: dormancy changes with the clock, so a module-level cache would freeze it at instance start. Unmatched ids resolve to `null`, not an error.
-
-- [ ] **Step 3: Add it to the context**
-
-In `play/index.js`, add `venueActivityLoader: createVenueActivityLoader()` beside `matchLoader`.
-
-- [ ] **Step 4: Add the SDL fields and the field resolvers**
-
-`lastActivityAt: Date` and `isDormant: Boolean!` on `Venue`. A `Venue` resolver object in `Queries.js` (exported and wired in `index.js` alongside `Match`) resolves both from `context.venueActivityLoader`. `isDormant` is `true` when there is no activity at all or it is older than `DORMANT_AFTER_DAYS` — non-null because the loader can always answer.
-
-**Do not add these columns to any of the three `SELECT` lists from Task 6.** That is what keeps `getAllVenues` untouched and dormancy out of the module-level `venueLoader` cache.
-
-- [ ] **Step 5: Verify against the known data**
-
-```graphql
-query { getAllVenues { id name lastActivityAt isDormant } }
-```
-
-Expected, given match history as of 2026-11-19: venue 3 `2026-10-31` not dormant; venue 1 `2026-10-12` not dormant; venue 2 `2026-09-06` **dormant**; venue 4 `2025-11-30` **dormant**. Confirm all four are still **present** — the filter is off by default, by design.
-
-- [ ] **Step 6: Verify the predicate excludes what it should**
-
-In a rolled-back transaction, insert a match at venue 4 with `match_start_time` a year in the future, and another with `is_deleted = true` and a recent start. Re-query.
-Expected: venue 4's `lastActivityAt` is **unchanged** by both. Then insert a recent match with `match_status = 'MATCH_INVITATION_DECLINED'` — also no change. `ROLLBACK`.
-
-- [ ] **Step 7: Make `searchVenues`' `includeDormant` real**
-
-Task 7 accepts the flag and ignores it. Now honour it: when `includeDormant` is `false`, `searchVenuesFromDb` joins the same activity aggregate as a subquery and excludes venues whose `last_activity_at` is null or older than `DORMANT_AFTER_DAYS`. The ordering gains a dormant-last term in all cases, per the spec — dormancy affects sort order by default and membership only when asked.
-
-Verify: `searchVenues(data: { includeDormant: false })`.
-Expected, given the 2026-11-19 history: venues 2 and 4 absent, 1 and 3 present. Then with the default (omit the flag): all four present, with 2 and 4 ordered last.
-
-- [ ] **Step 8: Verify the no-location fallback is alphabetical**
-
-`searchVenues(data: {})` — no coordinates, no query.
-Expected, given the current four venues: Gymkhana Turf, NR Bhagat Turf, Presentation Convent School Turf, Terna College Turf — plain alphabetical, with no popularity or relevance term anywhere in the `ORDER BY`.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add graphql/dataloaders/venueActivityLoader.js graphql/model/PlayModel.js graphql/schema/Play.js graphql/resolvers/Play/Queries.js play/index.js
-git commit -m "feat(venues): resolve venue activity and dormancy per request"
-```
+> **Removed 2026-11-24 by the project owner**, not fixed and not deferred mid-flight:
+> *"No need for the dormancy algorithms, we are still building the earliest of the systems,
+> at this point no need for perfection."*
+>
+> The whole mechanism comes out: `Venue.isDormant`, `Venue.lastActivityAt`, their field
+> resolvers, `getVenueActivityByIdsFromDb`, `createVenueActivityLoader`, the
+> `venueActivityLoader` context entry in `play/index.js`, the `includeDormant` field on
+> `venueSearchInput` (which Task 7 introduced), and `DORMANT_AFTER_DAYS` in
+> `graphql/utils/venueGeo.js`.
+>
+> **What must survive unchanged**, exactly as Task 7 left it:
+> - `searchVenues` ordering — distance ascending with null-`geog` rows last when `lat`+`lng`
+>   are supplied, otherwise `name` alphabetical. No dormancy term anywhere.
+> - Status filtering — always exclude `REJECTED` and `MERGED`; exclude `CLOSED` unless
+>   `includeClosed`.
+> - `getAllVenues` byte-identical.
+> - The `searchVenuesFromDb(params, client = pool)` affordance.
+>
+> **Proof of removal, not merely of disabling:** `searchVenues(data:{includeDormant:false})`
+> and `getAllVenues { id isDormant }` must both fail GraphQL **validation** ("Unknown
+> argument" / "Cannot query field"), and
+> `grep -rn "DORMANT\|isDormant\|lastActivityAt\|venueActivityLoader\|includeDormant" graphql/ play/`
+> must return nothing.
+>
+> It is backlogged in Task 14 with the work already done written down, so bringing it back
+> is re-applying a known design rather than rediscovering it. What was learned and is worth
+> keeping: the activity predicate must exclude soft-deleted matches, declined invitations
+> (`match_status = 'MATCH_INVITATION_DECLINED'`) and future kickoffs (`match_start_time <= now()`)
+> — measured against real data, those three clauses exclude 6 of 49 matches, so an unqualified
+> `max(match_start_time)` would report a date that has not happened yet. Any loader for it must
+> be built **per request**, because dormancy changes with the clock and the module-level
+> `venueLoader` caches for the whole process lifetime.
 
 ---
 
@@ -700,11 +662,22 @@ git commit -m "feat(venues): add admin venue review queue"
 In one transaction, in this order:
 1. Reject `mergeIntoVenueId === venueId`; reject a target whose status is `MERGED` or `REJECTED` — **no chains**, so the redirect is always one hop.
 2. `UPDATE play.matches SET venue_id = $target WHERE venue_id = $source`.
-3. `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source`.
+3. **Clear the two report collisions, then repoint the reports.** A bare `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source` **fails** — both hazards were confirmed empirically against the live schema on 2026-11-23, and the second is the single most likely merge path there is. In order:
+
+   a. **The report this merge answers.** Rows with `venue_id = $source AND duplicate_of_venue_id = $target` are reports saying "source is a duplicate of target" — exactly what `duplicate_of_venue_id` exists for, and exactly what the admin is acting on. Repointing one would leave `venue_id = duplicate_of_venue_id = $target` and trip `venue_reports_no_self_duplicate_check` with `23514`, aborting the whole merge. Resolve them instead: `status = 'RESOLVED'`, `resolution_note` naming the merge, `resolved_by = $adminPlayerId`, `resolved_at = now()`, **and `duplicate_of_venue_id = NULL`** so the row survives the repoint in step (d).
+
+   b. **Pointers at the disappearing venue.** Rows with `duplicate_of_venue_id = $source` should now point at the survivor: set `duplicate_of_venue_id = $target`. Except where that row's own `venue_id = $target` — those would become self-referential and trip the same check — so for those, set `duplicate_of_venue_id = NULL` and resolve them as in (a); the duplicate they named has been merged away, so the report is answered.
+
+   c. **Open reports colliding on the partial unique index.** If one user holds an `OPEN` report on both source and target, repointing makes two rows `(target, user, OPEN)` and trips `venue_reports_one_open_per_user_venue` with `23505`. Resolve the **source** one — the target's already points at the surviving venue — with a `resolution_note` naming the merge.
+
+   d. Only now `UPDATE play.venue_reports SET venue_id = $target WHERE venue_id = $source`.
+
 4. **Move** `google_place_id` to the target if the target has none: set it on the target, `NULL` it on the source. Copy coordinates and details the target lacks.
 5. Set `merged_into_venue_id = $target`, `status = 'MERGED'` on the source.
 
 Step 4 must *move* and not copy: the source row lives forever and `venues_google_place_id_uniq` forbids two non-null rows sharing a place_id.
+
+**Verification for step 3 is mandatory, and the plain case passing proves nothing.** An ordinary report repoints fine; it is these three that break. See Step 6.
 
 - [ ] **Step 4: Implement `adminResolveVenueReport`**
 
@@ -719,6 +692,16 @@ On a throwaway `UNVERIFIED` venue: `VERIFY` with corrected `lat`/`lng` — expec
 Create two throwaway venues, give the **source** a `google_place_id` and the target none, put a match on the source (or use a transaction on venue 2's real matches and roll back). `MERGE` source into target.
 
 Expected: every match repointed to the target; target now holds the `google_place_id`; **source's `google_place_id` is `NULL`**; source `status = 'MERGED'` with `merged_into_venue_id` set; source row still present; no `23505`. Then confirm `submitVenue` with that place_id now returns the **target**. Then attempt to merge the target into the already-merged source — expected rejection, no chain.
+
+- [ ] **Step 6b: Verify the three report collisions from Step 3, each one specifically**
+
+A merge whose reports repoint cleanly proves nothing — only these three break. For each, set the state up, run `MERGE`, and confirm it **completes** rather than aborting:
+
+1. A `DUPLICATE` report with `venue_id = source`, `duplicate_of_venue_id = target`. Without step 3(a) this aborts with `23514 venue_reports_no_self_duplicate_check`. Expected after: the merge succeeded and that report is `RESOLVED` with `duplicate_of_venue_id` null.
+2. A report elsewhere with `duplicate_of_venue_id = source`. Expected after: it points at the target — or is `RESOLVED` with a null pointer if its own `venue_id` is the target.
+3. One user holding an `OPEN` report on **both** source and target. Without step 3(c) this aborts with `23505 venue_reports_one_open_per_user_venue`. Expected after: the merge succeeded, the source-side report is `RESOLVED`, and the target-side one is still `OPEN`.
+
+Then confirm the ordinary case still works: a plain `WRONG_DETAILS` report on the source ends up on the target, still `OPEN`.
 
 - [ ] **Step 7: Verify report resolution closes the queue item**
 
@@ -782,8 +765,12 @@ git commit -m "feat(matches): reject closed, merged and rejected venues on match
 - `play.venues.pincode` is an `integer` — fine for Indian six-digit pincodes, wrong in principle. Deliberately untouched.
 - The module-level `venueLoader` caches for the process lifetime, and venue data now changes through admin action rather than never, so a verified or merged venue serves stale from warm instances. Pre-existing item, newly sharper.
 - Dormancy filtering is built but off by default; revisit the 90-day cutoff when there are enough venues for it to be a kindness. Record that at four venues it would have hidden two, including one with 14 matches.
+- **Dormancy / "stale venue" handling — removed 2026-11-24 at the owner's request** (*"no need for the dormancy algorithms, we are still building the earliest of the systems"*), not merely disabled. `Venue.isDormant`, `Venue.lastActivityAt`, the per-request activity loader, `includeDormant` on `venueSearchInput` and `DORMANT_AFTER_DAYS` were all taken back out, so nothing about a venue's last activity is exposed or queried today. If it returns, the design is already settled and two findings are worth not rediscovering: (1) the activity predicate must exclude soft-deleted matches, `match_status = 'MATCH_INVITATION_DECLINED'`, and future kickoffs (`match_start_time <= now()`) — measured on real data those three clauses exclude 6 of 49 matches, so an unqualified `max(match_start_time)` reports a date that has not happened yet; (2) any loader must be built **per request**, because dormancy changes with the clock while the module-level `venueLoader` caches for the whole process lifetime. Also settled: dormancy must not touch `ORDER BY` — when it did, the alphabetically-first venue was pushed to the bottom of the picker. Trigger: enough venues that genuinely dead ones clutter the picker.
 - **Venue ranking for the no-location case — deferred 2026-11-23, revisit once the app has users.** `searchVenues` falls back to alphabetical when it has no coordinates. Popularity ordering (match count, recent-weighted) was designed and deliberately dropped: with no users, a ranking built on 49 historical matches would encode noise rather than preference. When there is real usage, the ordering hook is one `ORDER BY` in `searchVenuesFromDb`, and the activity aggregate in `getVenueActivityByIdsFromDb` is where the counts would come from. Open questions for then: whether to weight recent activity over all-time and over what window, whether to expose the count as a `Venue` field for a "most played here" label, and whether personal history ("venues you've played at") beats global popularity as a picker default.
+- **Typo tolerance across every search surface — one coordinated change, not per-feature. Decided 2026-11-24.** All search in this codebase is case-insensitive **substring** matching (`ILIKE '%…%'`), which is not typo-tolerant: `"CONVENT"` finds Presentation Convent but `"convnt"` finds nothing. The surfaces today are `searchVenuesFromDb` (`PlayModel.js`, venue name) and `getClubsListFromDb` (`PlayModel.js:246`, club name/locality/description). Both already escape LIKE metacharacters through `escapeLike` in `graphql/utils/clubSearch.js`, and `pg_trgm` is installed with `similarity()` already used as an ordering tiebreak in venue search. Moving to typo tolerance means adding a `%` similarity predicate alongside the substring match, choosing a similarity threshold, and deciding how similarity ranking interacts with each surface's current ordering — venue search is deliberately alphabetical, club search has its own name/locality/description precedence. Do it for all surfaces at once so the behaviour is consistent; piecemeal would leave searches that behave differently from each other. Trigger: when lists get long enough that typing is the only practical way to find something.
 - `VENUE_FORMATS` exists in `venueGeo.js` and `play.matches.format` is still unconstrained; converging them is a follow-up.
+- `ORDER BY (geog IS NULL), geog <-> point` in `searchVenuesFromDb` cannot use `venues_geog_gix` — the leading null-check term defeats the KNN operator, so EXPLAIN shows Seq Scan + Sort even with `enable_seqscan = off`. Deliberate: keeping uncoordinated venues in the result matters more than index usage, and at four rows a scan is free. The fix at scale is a `UNION ALL` of a KNN query over located rows plus the null-geog rows. Trigger: a few thousand venues in one city.
+- `venues_name_trgm` was created with an unqualified `gin_trgm_ops`, while the rest of `20261123100100_extend_venues.js` schema-qualifies everything for `search_path` robustness. It cannot break the existing index — an operator class resolves once at creation — so it is a reproducibility wrinkle only, and the migration was deliberately not edited after it had run. Qualify it if the index is ever rebuilt.
 - Whether `play.matches.venue_id` should become `NOT NULL` (0 of 49 are null today).
 - Deferred by the brief: booking integration, the owner-claim flow, a venue edit-suggestions table, multi-city tooling, and admin notification of new submissions (with the reason it was dropped).
 

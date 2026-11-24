@@ -38,6 +38,39 @@ live race (no `await` between assignment and `resolve`), just worth tidying.
 
 ## Correctness
 
+### `test.matches.match_start_time` is nullable and should be `NOT NULL` — MEDIUM
+**Where:** `test.matches.match_start_time` (confirmed nullable against production
+2026-10-29); consumers include `utils/matchAuth.js` `getResultWindowState`,
+`model/PlayModel.js` `getRatingTrendFromDb`, and `utils/ratingMath.js`.
+
+No row is NULL today, and every creation path already supplies the value —
+`createMatchInput.matchStartTime` is `Date!` in the SDL, so the API cannot
+produce one. The column is simply permissive where the application is not.
+
+**Why it matters now.** Three places would misbehave on a NULL, all silently:
+
+- The rating **trend** orders `ORDER BY m.match_start_time DESC, pmr.match_id DESC`.
+  Postgres sorts NULLs *first* under `DESC`, so a dateless match would become the
+  newest point on a player's trend line.
+- `ratingMath.js` derives the recency window from `new Date(matchStartTime)`. A
+  NULL gives `NaN`, whose comparisons are all false, so the ×2 window would be
+  assigned arbitrarily once a player has more than three rated matches.
+- `getResultWindowState` already treats an unparseable start as `CLOSED`, which
+  means a NULL match could never have a result recorded at all.
+
+**Fix:** `ALTER TABLE test.matches ALTER COLUMN match_start_time SET NOT NULL;`
+as a knex migration. Verify `SELECT count(*) FROM test.matches WHERE
+match_start_time IS NULL` is 0 immediately before running it — the `ALTER` takes
+an `ACCESS EXCLUSIVE` lock and scans the table, which is brief at current size
+(43 rows) but will not stay that way.
+
+While in there, consider the same question for `test.players.is_deleted`, which
+is also nullable with **no default**. Every read in the codebase already spells
+it `IS NOT TRUE` for exactly that reason; a `NOT NULL DEFAULT false` would let
+those reads become plain `= false`.
+
+*Raised 2026-10-29, during the player-rating-system migration run.*
+
 ### `playersAway` returns the home roster when a match has no away team — MEDIUM
 **Where:** `functions/graphql/model/PlayModel.js:32-35`, reached from
 `Match.playersAway`
@@ -74,7 +107,7 @@ straight from the DB row, so all eight of its multi-word fields are snake_case.
 | Schema | Type | snake_case fields |
 |---|---|---|
 | both | `Club` | `total_members`, `jersey_color_home`, `jersey_color_away`, `is_banned`, `review_status`, `review_notes`, `created_at`, `updated_at` |
-| Auth | `Player` | `first_name`, `last_name`, `profile_picture`, `is_banned`, `saved_upi_ids`, `created_at`, `updated_at`, `is_deleted` |
+| Auth | `Player` | ~~`first_name`, `last_name`, `profile_picture`~~ **(done 2026-08-25)**, `is_banned`, `saved_upi_ids`, `created_at`, `updated_at`, `is_deleted` |
 | Auth | `PlayerBasicDetails` | `is_banned`, `saved_upi_ids`, `created_at`, `updated_at` |
 | Auth | `ClubBasic` | `is_admin` |
 | Auth | `createClubInput`, `updateClubInput` | `jersey_color_home`, `jersey_color_away` |
@@ -99,6 +132,13 @@ straight rename breaks every client query touching those 29 fields at once. Inpu
 
 **Do this before the club-domain consolidation**, not after — consolidation moves resolvers
 between schemas, which is exactly what this inconsistency punishes.
+
+**Progress 2026-08-25:** the three name fields on `auth.Player` were renamed to camelCase
+(`fix/auth-player-field-casing`), after the frontend hit the validation error described
+below during integration. That needed a mapper rather than a schema edit alone — both
+producers (`userWithPhoneExists` on the login path, and `ClubJoinRequest.player`) return
+raw database rows. `graphql/utils/playerMappers.js` now exists and is the pattern to follow
+for the remaining types. **26 fields still to go.**
 
 *Raised 2026-08-24.*
 
@@ -198,6 +238,64 @@ currently means only "no unsolicited request notifications".
 ---
 
 ## Architecture
+
+### No migration system — adopt knex migrations for schema changes — MEDIUM
+**Where:** `functions/package.json` (no `knex` dependency); schema history lives only in plan
+docs, e.g. `docs/superpowers/plans/2026-08-15-club-joining-requests.md` Task 1 and
+`docs/superpowers/plans/2026-09-14-record-match-result-backend.md` Task 1
+
+Every schema change so far has been SQL pasted into a plan and run by hand against the dev
+database. Nothing records which changes have run where, a new environment cannot be rebuilt
+from the repo, and there is no down path. The record-match-result work alone converted 16
+timestamp columns, deleted test matches, and added two tables this way.
+
+**Decision (2026-09-14):** from the next schema change onward, changes ship as knex
+migrations.
+
+**Setup to do:**
+- Add `knex` to `functions` and a `knexfile.js` reading the same `DB_HOST` / `DB_USER` /
+  `DB_PASSWORD` / `DB_NAME` env vars as `graphql/config/dbConfig.js`, with `ssl: true` and the
+  `test` schema.
+- Use knex **only for migrations**. Queries stay on the existing `pg` pool; no query-builder
+  rewrite.
+- Keep the migrations table in the `test` schema too (`migrations.schemaName`), so it sits
+  beside the tables it tracks.
+- Write a **baseline migration** that marks the current schema as applied, so the first
+  real migration does not try to recreate existing tables. Do not replay the old plan SQL.
+- Add `migrate:latest`, `migrate:rollback` and `migrate:make` npm scripts, and decide where
+  migrations run: by hand before `npm run deploy`, or as a deploy step. Not from inside the
+  Cloud Function at cold start, where concurrent instances would race on the lock.
+- Every migration gets a real `down`. A data-destroying `up` (like the test-match deletes)
+  says so in the file.
+
+*Raised 2026-09-14, after hand-running the record-match-result DDL.*
+
+**DONE 2026-10-29.** knex is installed as a **devDependency** (migration tool
+only — it must stay out of the Cloud Function bundle, and queries remain on the
+`pg` pool), configured in `functions/knexfile.js` with
+`migrations.schemaName: "test"`, and driven by `migrate:latest` /
+`migrate:rollback` / `migrate:make`. The baseline migration is an empty no-op
+that marks the pre-knex schema as applied — there was no DDL in the repo to
+replay, since the live database was the only record of it.
+
+Batch 1 ran against production on 2026-10-29: the baseline, the `played` column
+on `player_match_map` with its backfill, and the two rating tables.
+`knex_migrations` and `knex_migrations_lock` were confirmed to land in `test`
+rather than `public`.
+
+Two things learned that the plan above did not anticipate:
+
+- **Adding knex moved production `lodash` from 4.17.21 to 4.18.1**, because knex
+  requires `^4.18.1` and npm deduped the tree onto one version satisfying both.
+  Holding it needs an `overrides` entry, and the entry must be written
+  `"lodash": "$lodash"` — a literal version is rejected with `EOVERRIDE` when it
+  contradicts a direct dependency spec.
+- **Checking a `pg_dump` of `test` into the repo is still worth doing.** Without
+  it the baseline is a promise rather than a record, and a new environment still
+  cannot be rebuilt from the repo — which was half of this item's original point.
+
+*Still open from this item: the `pg_dump` baseline, and deciding whether
+migrations run by hand before `npm run deploy` or as a deploy step.*
 
 ### `play` carries most traffic — consider splitting the function — MEDIUM
 **Where:** `functions/index.js` — only two functions are exported, `ballersApiAuth` and
