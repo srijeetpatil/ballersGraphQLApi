@@ -34,11 +34,25 @@ live race (no `await` between assignment and `resolve`), just worth tidying.
 
 *Raised 2026-08-22 while reviewing the club-joining-requests work.*
 
+### Hardcoded RSA private key in `graphql/utils/common.js` — HIGH
+**Where:** `functions/graphql/utils/common.js` (a `-----BEGIN RSA PRIVATE KEY-----` block
+near the top of the file, committed to the repository)
+
+A private key lives in source control. Pre-existing and unrelated to venues; noticed in
+passing. It needs to move into configuration (environment or a secret manager) and the key
+needs to be **rotated**, since anything that has been committed must be treated as exposed
+regardless of who has read access today. Triage before anything else in this file that is
+not the SQL injection item above.
+
+*Noticed 2026-11-24.*
+
 ---
 
 ## Correctness
 
 ### `test.matches.match_start_time` is nullable and should be `NOT NULL` — MEDIUM
+*(Schema note: the table is now `play.matches`; `test.` below is the name at the time of writing.)*
+
 **Where:** `test.matches.match_start_time` (confirmed nullable against production
 2026-10-29); consumers include `utils/matchAuth.js` `getResultWindowState`,
 `model/PlayModel.js` `getRatingTrendFromDb`, and `utils/ratingMath.js`.
@@ -188,6 +202,11 @@ would be a **security bug** for anything viewer-scoped, which is why
 *Note: an outcome alert's description is built from `clubLoader` and then persisted
 (`ClubJoinRequests.js`), so a stale name can be baked permanently into an alert row.
 `createMatchInviteAlerts` deliberately reads uncached for this reason.*
+
+**Update 2026-11-24:** sharper now. Venue rows used to never change; they now change through
+admin action (verify, edit, close, reject, merge). `venueLoader` therefore serves a stale
+status, name or `merged_into_venue_id` from any warm instance after an admin acts. See
+"Venues" below for how this interacts with the match-creation guard.
 
 ### Raw `pg` error text reaches the client — LOW
 Non-23505 failures concatenate `error.message`, exposing constraint and schema names.
@@ -378,6 +397,163 @@ Connector: real cost and ops overhead for one indexed lookup.
 beyond `viewerScope` or request volume makes it visible in latency.
 
 *Raised 2026-08-22.*
+
+---
+
+## Venues
+
+Deferred from the work that made venues a canonical entity (statuses, coordinates/PostGIS,
+user submissions, problem reports, the admin review queue, and the guard that stops matches
+being created on unpickable venues). Grouped by theme; each item says why it was left and
+what would make it worth doing.
+
+### Admin and moderation gaps
+
+#### No admin path out of `REJECTED` — MEDIUM
+`adminReviewVenue` refuses `VERIFY` on a `REJECTED` venue, deliberately, so a single stray
+action cannot resurrect a venue already judged not real. `EDIT` cannot change status. So a
+**mistaken rejection cannot be undone through the API**; it takes hand-run SQL.
+
+**Fix:** an explicit, auditable `REOPEN` (or `UNREJECT`) action that sets status back to
+`UNVERIFIED`, as its own change. **Do not** fix it by loosening the `VERIFY` gate — the gate
+is correct, the missing piece is a deliberate way out. **Trigger:** the first time an admin
+rejects the wrong venue.
+
+#### `isAppAdminFromDb` does not check `is_deleted` — MEDIUM
+**Where:** `functions/graphql/model/AuthModel.js:181`
+
+A soft-deleted admin still passes the admin check. Identical across every existing admin
+resolver, so it was left out of the venues work to avoid a one-off fix that would make the
+resolvers inconsistent. It should not stay unexamined: fix it once, in the shared helper
+(`AND is_deleted IS NOT TRUE`, the spelling the rest of the codebase uses), and confirm
+every admin resolver goes through it. **Trigger:** before the admin set grows beyond people
+you know personally, or whenever an admin account is deleted.
+
+### Merge concurrency
+
+Both items below are narrow races in the venue merge. Neither can corrupt data: the worst
+outcome is an error to the admin and a clean rollback. They were parked for that reason.
+
+#### `reportVenueProblem` does not lock the venue row it reads — LOW
+A user filing a report on the merge **source** in the gap between merge steps (c) (clear
+colliding open reports) and (d) (repoint open reports) makes the repoint hit
+`venue_reports_one_open_per_user_venue` and the whole merge aborts with a raw `23505`.
+`SELECT ... FOR UPDATE` on the merge side cannot block an `INSERT`, so closing the window
+needs the lock on the **report mutation's side** (lock the venue row it reads, so it
+serialises against the merge). **Trigger:** merges become frequent enough, or reports
+concurrent enough, that an admin actually sees the opaque error.
+
+#### The merge's inbound repoint locks rows outside the id-ordered discipline — LOW
+**Where:** `functions/graphql/model/PlayModel.js`, around the step-4 repoint
+(`UPDATE play.venues SET merged_into_venue_id = $target WHERE merged_into_venue_id = $source`)
+
+The rest of the merge takes its row locks in id order. This statement locks the inbound rows
+(venues already merged into the source) in whatever order the scan finds them, so two admins
+merging concurrently can deadlock with `40P01` — specifically when one is re-merging an
+already-merged venue and an inbound id is lower than the target id. That needs two
+simultaneous merges, one of which was already invalid. Result is a full rollback.
+
+**Cheapest fix:** fold the inbound ids into the initial id-ordered lock. **Trigger:** a
+second admin, or any `40P01` in the logs.
+
+### Input limits
+
+#### `submitVenue`'s text fields are uncapped — LOW
+`address`, `locality` and `city` have no length limit. `reportVenueProblem`'s `note` is
+capped at 1000 trimmed characters; these are the same unbounded-`text` exposure. They were
+left out of the report work deliberately so that diff stayed about one thing. **Fix:** trim
+and cap them the way `note` is, and decide the limits once for all three (and `name`, if it
+is not already bounded). **Trigger:** do it with the next change that touches `submitVenue`,
+or sooner if submissions are opened to a wider audience.
+
+### Search and ranking
+
+#### Typo tolerance across every search surface — one coordinated change
+*Decided 2026-11-24.* All search in this codebase is case-insensitive **substring**
+matching (`ILIKE '%…%'`), which is not typo-tolerant: `"CONVENT"` finds Presentation Convent
+but `"convnt"` finds nothing. The surfaces today are `searchVenuesFromDb` (`PlayModel.js`,
+venue name) and `getClubsListFromDb` (`PlayModel.js:246`, club name/locality/description).
+Both already escape LIKE metacharacters through `escapeLike` in
+`graphql/utils/clubSearch.js`, and `pg_trgm` is installed with `similarity()` already used as
+an ordering tiebreak in venue search.
+
+Moving to typo tolerance means adding a `%` similarity predicate alongside the substring
+match, choosing a similarity threshold, and deciding how similarity ranking interacts with
+each surface's current ordering — venue search is deliberately alphabetical, club search has
+its own name/locality/description precedence. Do it for all surfaces at once so the
+behaviour is consistent; piecemeal would leave searches that behave differently from each
+other. **Trigger:** lists long enough that typing is the only practical way to find
+something.
+
+#### Venue ranking for the no-location case — deferred 2026-11-23
+`searchVenues` falls back to alphabetical when it has no coordinates. Popularity ordering
+(match count, recent-weighted) was designed and deliberately dropped: with no users, a
+ranking built on 49 historical matches would encode noise rather than preference.
+
+When there is real usage, the ordering hook is one `ORDER BY` in `searchVenuesFromDb`, and
+the activity aggregate in `getVenueActivityByIdsFromDb` is where the counts would come from.
+Open questions for then: whether to weight recent activity over all-time and over what
+window; whether to expose the count as a `Venue` field for a "most played here" label; and
+whether personal history ("venues you've played at") beats global popularity as a picker
+default. **Trigger:** the app has users.
+
+#### Dormancy / "stale venue" handling — removed 2026-11-24
+Removed at the owner's request (*"no need for the dormancy algorithms, we are still building
+the earliest of the systems"*), not merely disabled. `Venue.isDormant`,
+`Venue.lastActivityAt`, the per-request activity loader, `includeDormant` on
+`venueSearchInput` and `DORMANT_AFTER_DAYS` were all taken back out, so nothing about a
+venue's last activity is exposed or queried today.
+
+If it returns, the design is already settled and these findings are worth not
+rediscovering:
+
+1. The activity predicate must exclude soft-deleted matches,
+   `match_status = 'MATCH_INVITATION_DECLINED'`, and future kickoffs
+   (`match_start_time <= now()`). Measured on real data those three clauses exclude 6 of 49
+   matches, so an unqualified `max(match_start_time)` reports a date that has not happened
+   yet.
+2. Any loader must be built **per request**, because dormancy changes with the clock while
+   the module-level `venueLoader` caches for the whole process lifetime.
+3. Dormancy must not touch `ORDER BY` — when it did, the alphabetically-first venue was
+   pushed to the bottom of the picker.
+
+**Trigger:** enough venues that genuinely dead ones clutter the picker.
+
+### Performance and index hygiene
+
+#### `searchVenuesFromDb` cannot use `venues_geog_gix` — deferred
+`ORDER BY (geog IS NULL), geog <-> point` — the leading null-check term defeats the KNN
+operator, so `EXPLAIN` shows Seq Scan + Sort even with `enable_seqscan = off`. Deliberate:
+keeping uncoordinated venues in the result matters more than index usage, and at four rows a
+scan is free. The fix at scale is a `UNION ALL` of a KNN query over located rows plus the
+null-geog rows. **Trigger:** a few thousand venues in one city.
+
+#### `venues_name_trgm` was created with an unqualified `gin_trgm_ops` — LOW
+The rest of `20261123100100_extend_venues.js` schema-qualifies everything for `search_path`
+robustness; this index does not. It cannot break the existing index (an operator class
+resolves once, at creation), so it is a reproducibility wrinkle only. The migration was
+deliberately not edited after it had run. **Fix:** qualify it if the index is ever rebuilt.
+
+### Schema constraints and loose ends
+
+- **`play.venues.pincode` is an `integer`.** Fine for Indian six-digit pincodes (no leading
+  zeros), wrong in principle. Deliberately untouched.
+- **`VENUE_FORMATS` exists in `venueGeo.js`, but `play.matches.format` is still
+  unconstrained.** Converging them (validate or constrain the column against the list) is a
+  follow-up.
+- **Should `play.matches.venue_id` become `NOT NULL`?** 0 of 49 rows are null today, so it
+  would apply cleanly, but nothing has been decided about whether matches without a venue
+  are a legitimate state.
+
+### Deferred features
+Booking integration, the owner-claim flow, a venue edit-suggestions table, multi-city
+tooling, and admin notification of new submissions were scoped out of the first version.
+
+Admin notification was dropped on 2026-11-24 at the owner's request. The app has a single
+admin who reviews and verifies every submission by hand, and the review queue already
+surfaces new submissions; a notification channel would add a delivery mechanism, a template
+and a failure mode for something the admin is already looking at directly. **Trigger:** more
+than one admin, or enough submission volume that an admin stops checking the queue daily.
 
 ---
 
