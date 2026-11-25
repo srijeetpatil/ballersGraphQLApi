@@ -429,6 +429,25 @@ resolvers inconsistent. It should not stay unexamined: fix it once, in the share
 every admin resolver goes through it. **Trigger:** before the admin set grows beyond people
 you know personally, or whenever an admin account is deleted.
 
+### Rejecting a venue leaves inbound duplicate pointers aimed at it — LOW
+**Where:** `graphql/resolvers/Play/Venues.js` (the `REJECT` branch), alongside
+`resolveOpenVenueReportsFromDb` in `graphql/model/PlayModel.js`.
+
+Rejecting venue X resolves the open reports filed *on* X, but an open report elsewhere whose
+`duplicate_of_venue_id` is X keeps pointing at a now-REJECTED venue — and the obvious
+follow-up, merging into X, is refused because X is rejected. So that report cannot be
+actioned either way without the admin editing it by hand.
+
+The merge already handles the same shape in its own direction: its step 2b redirects or
+resolves pointers aimed at the venue disappearing. `REJECT` has no equivalent. It is
+harmless today (`play.venue_reports` holds 0 rows) and it is arguably a product question
+rather than a defect — whether rejecting a venue should answer the reports that merely
+*mention* it is a judgement call, not an invariant.
+
+**Trigger:** the first time an admin rejects a venue that other open reports name as a
+duplicate target. Worth deciding alongside the REOPEN action above, since both are about
+what an admin can undo.
+
 ### Merge concurrency
 
 Both items below are narrow races in the venue merge. Neither can corrupt data: the worst
